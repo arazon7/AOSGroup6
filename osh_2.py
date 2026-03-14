@@ -1,439 +1,393 @@
-#!/usr/bin/env python3
 import os
 import platform
 import shlex
 import signal
+import subprocess
 import sys
-import time
-from subprocess import Popen
+import threading
+import shutil
 
 IS_WINDOWS = platform.system() == "Windows"
 
-# -------------------------
-# Job Table (basic)
-# -------------------------
-RUNNING, STOPPED, DONE = "Running", "Stopped", "Done"
+jobs = []
+job_counter = 1
 
-class Job:
-    _next_id = 1
-    def __init__(self, proc: Popen, cmdline: str):
-        self.job_id = Job._next_id
-        Job._next_id += 1
-        self.proc = proc                          # subprocess.Popen handle
-        self.pgid = _get_pgid(proc.pid)           # process group id
-        self.cmdline = cmdline
-        self.status = RUNNING
+# job_id -> threading.Thread for jobs currently foregrounded
+fg_threads = {}
 
-    def refresh_status(self):
-        rc = self.proc.poll()
-        if rc is not None:
-            self.status = DONE
-        return self.status
 
-class JobTable:
-    def __init__(self):
-        self.jobs = []
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-    def add(self, job: Job):
-        self.jobs.append(job)
-        return job.job_id
+def update_jobs():
+    for job in jobs:
+        if job["status"] == "Running":
+            if job["process"].poll() is not None:
+                job["status"] = "Finished"
 
-    def remove_done(self):
-        self.jobs = [j for j in self.jobs if j.refresh_status() != DONE]
 
-    def find_by_id(self, jid: int):
-        for j in self.jobs:
-            if j.job_id == jid:
-                return j
-        return None
+def find_job(job_id):
+    for job in jobs:
+        if job["job_id"] == job_id:
+            return job
+    return None
 
-    def list(self):
-        for j in self.jobs:
-            j.refresh_status()
-        return self.jobs[:]
 
-JOBS = JobTable()
-FOREGROUND_PGID = None
-
-# -------------------------
-# Cross-platform helpers
-# -------------------------
-def _get_pgid(pid):
-    """Return process group id; falls back to pid on Windows."""
+def clear_screen():
     if IS_WINDOWS:
-        return pid
-    return os.getpgid(pid)
-
-def _new_session_kwargs():
-    """Subprocess kwargs to isolate the child into its own process group."""
-    if IS_WINDOWS:
-        import subprocess
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-    return {"preexec_fn": os.setsid}
-
-def _killpg(pgid, sig):
-    """Send signal to a process group; single-process fallback on Windows."""
-    if IS_WINDOWS:
-        os.kill(pgid, signal.SIGTERM)
+        subprocess.call("cls", shell=True)
     else:
-        os.killpg(pgid, sig)
+        subprocess.call("clear", shell=True)
 
-def _send_cont(pgid):
-    """Resume a stopped process group (no-op on Windows — no SIGCONT)."""
-    if not IS_WINDOWS and hasattr(signal, "SIGCONT"):
-        os.killpg(pgid, signal.SIGCONT)
 
-# -------------------------
-# Built-ins (in-process)
-# -------------------------
-def builtin_cd(args):
-    target = args[1] if len(args) > 1 else os.environ.get("HOME", ".")
-    try:
-        os.chdir(target)
-        return 0
-    except Exception as e:
-        print(f"cd: {e}", file=sys.stderr)
-        return 1
+def kill_process(pid):
+    if IS_WINDOWS:
+        result = subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise ProcessLookupError(f"Process {pid} not found or could not be killed")
+    else:
+        os.kill(pid, signal.SIGKILL)
 
-def builtin_pwd(args):
-    print(os.getcwd())
-    return 0
 
-def builtin_echo(args):
-    print(" ".join(args[1:]))
-    return 0
-
-def builtin_clear(args):
-    sys.stdout.write("\033[2J\033[H")
-    sys.stdout.flush()
-    return 0
-
-def builtin_exit(args):
-    raise SystemExit(0)
-
-# ----- Filesystem built-ins -----
-def builtin_ls(args):
-    path = args[1] if len(args) > 1 else "."
-    try:
-        for name in sorted(os.listdir(path)):
-            print(name)
-        return 0
-    except Exception as e:
-        print(f"ls: {e}", file=sys.stderr)
-        return 1
-
-def builtin_cat(args):
-    if len(args) < 2:
-        print("cat: missing filename", file=sys.stderr)
-        return 1
-    rc = 0
-    for fname in args[1:]:
+def resume_process(process):
+    if IS_WINDOWS:
         try:
-            with open(fname, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    print(line, end="")
-        except Exception as e:
-            print(f"cat: {fname}: {e}", file=sys.stderr)
-            rc = 1
-    return rc
-
-def builtin_mkdir(args):
-    if len(args) < 2:
-        print("mkdir: missing operand", file=sys.stderr)
-        return 1
-    rc = 0
-    for d in args[1:]:
-        try:
-            os.mkdir(d)
-        except Exception as e:
-            print(f"mkdir: cannot create directory '{d}': {e}", file=sys.stderr)
-            rc = 1
-    return rc
-
-def builtin_rmdir(args):
-    if len(args) < 2:
-        print("rmdir: missing operand", file=sys.stderr)
-        return 1
-    rc = 0
-    for d in args[1:]:
-        try:
-            os.rmdir(d)
-        except Exception as e:
-            print(f"rmdir: failed to remove '{d}': {e}", file=sys.stderr)
-            rc = 1
-    return rc
-
-def builtin_rm(args):
-    if len(args) < 2:
-        print("rm: missing operand", file=sys.stderr)
-        return 1
-    rc = 0
-    for f in args[1:]:
-        try:
-            os.remove(f)
-        except Exception as e:
-            print(f"rm: cannot remove '{f}': {e}", file=sys.stderr)
-            rc = 1
-    return rc
-
-def builtin_touch(args):
-    if len(args) < 2:
-        print("touch: missing file operand", file=sys.stderr)
-        return 1
-    rc = 0
-    for f in args[1:]:
-        try:
-            with open(f, "a"):
-                os.utime(f, None)
-        except Exception as e:
-            print(f"touch: cannot touch '{f}': {e}", file=sys.stderr)
-            rc = 1
-    return rc
-
-# ----- Job control built-ins -----
-def builtin_jobs(args):
-    for j in JOBS.list():
-        print(f"[{j.job_id}] {j.status:7} {j.pgid}   {j.cmdline}")
-    return 0
-
-def builtin_fg(args):
-    if len(args) < 2 or not args[1].lstrip("%").isdigit():
-        print("fg: usage: fg %<job_id>", file=sys.stderr)
-        return 1
-    jid = int(args[1].lstrip("%"))
-    job = JOBS.find_by_id(jid)
-    if not job:
-        print(f"fg: no such job {jid}", file=sys.stderr)
-        return 1
-    return move_job_foreground(job)
-
-def builtin_bg(args):
-    if len(args) < 2 or not args[1].lstrip("%").isdigit():
-        print("bg: usage: bg %<job_id>", file=sys.stderr)
-        return 1
-    jid = int(args[1].lstrip("%"))
-    job = JOBS.find_by_id(jid)
-    if not job:
-        print(f"bg: no such job {jid}", file=sys.stderr)
-        return 1
-    try:
-        _send_cont(job.pgid)
-        job.status = RUNNING
-        print(f"[{job.job_id}] Continued   {job.cmdline}")
-        return 0
-    except ProcessLookupError:
-        job.status = DONE
-        print(f"[{job.job_id}] Done        {job.cmdline}")
-        return 0
-
-def builtin_kill(args):
-    if len(args) < 2 or not args[1].isdigit():
-        print("kill: usage: kill <pid_or_pgid>", file=sys.stderr)
-        return 1
-    pid_or_pgid = int(args[1])
-    try:
-        try:
-            _killpg(pid_or_pgid, signal.SIGTERM)
+            import ctypes
+            ctypes.windll.kernel32.ResumeThread(
+                ctypes.windll.kernel32.OpenThread(0x0002, False, process.pid)
+            )
         except Exception:
-            os.kill(pid_or_pgid, signal.SIGTERM)
-        return 0
-    except ProcessLookupError:
-        print(f"kill: {pid_or_pgid}: no such process", file=sys.stderr)
-        return 1
-
-def builtin_help(args):
-    bg_example = "ping -n 5 127.0.0.1 &" if IS_WINDOWS else "sleep 5 &"
-    print(f"""Built-ins:
-  cd [dir]           change directory
-  pwd                print working directory
-  echo [text]        print text
-  clear              clear screen
-  exit               exit shell
-
-  ls [dir]           list directory entries
-  cat <file> [...]   print file contents
-  mkdir <dir> [...]  create directories
-  rmdir <dir> [...]  remove empty directories
-  rm <file> [...]    remove files
-  touch <file> [...] create/update files
-
-Process & job control:
-  jobs               list background jobs
-  fg %<id>           bring job to foreground
-  bg %<id>           resume job in background (Unix only)
-  kill <pid|pgid>    terminate process or process group
-
-External commands run from PATH. Use '&' to run in background.
-  Example: {bg_example}""")
-    return 0
-
-BUILTINS = {
-    "cd": builtin_cd,
-    "pwd": builtin_pwd,
-    "echo": builtin_echo,
-    "clear": builtin_clear,
-    "exit": builtin_exit,
-    "help": builtin_help,
-    "ls": builtin_ls,
-    "cat": builtin_cat,
-    "mkdir": builtin_mkdir,
-    "rmdir": builtin_rmdir,
-    "rm": builtin_rm,
-    "touch": builtin_touch,
-    "jobs": builtin_jobs,
-    "fg": builtin_fg,
-    "bg": builtin_bg,
-    "kill": builtin_kill,
-}
-
-def is_builtin(cmd):
-    return cmd in BUILTINS
-
-# -------------------------
-# Parsing & Prompt
-# -------------------------
-def parse_line(line: str):
-    """
-    Returns (argv:list[str], background:bool)
-    Uses shlex for shell-like parsing (quotes, escaped spaces).
-    Detects trailing '&' for background (with or without space).
-    posix=False on Windows to avoid mishandling backslash paths.
-    """
-    line = line.strip()
-    if not line:
-        return [], False
-
-    posix_mode = not IS_WINDOWS
-    bg = False
-    if line.endswith("&"):
-        try:
-            tokens = shlex.split(line[:-1].rstrip(), posix=posix_mode)
-            bg = True
-        except ValueError as e:
-            print(f"parse error: {e}", file=sys.stderr)
-            return [], False
+            pass
     else:
-        try:
-            tokens = shlex.split(line, posix=posix_mode)
-        except ValueError as e:
-            print(f"parse error: {e}", file=sys.stderr)
-            return [], False
+        os.kill(process.pid, signal.SIGCONT)
 
-    if tokens and tokens[-1] == "&":
-        tokens = tokens[:-1]
-        bg = True
 
-    return tokens, bg
+# ── fg runner ─────────────────────────────────────────────────────────────────
 
-def prompt():
-    try:
-        base = os.path.basename(os.getcwd()) or "/"
-    except Exception:
-        base = "?"
-    return f"osh:{base}$ "
-
-# -------------------------
-# Execution
-# -------------------------
-def launch_external(argv, background: bool, raw_cmdline: str):
+def _run_fg(job):
     """
-    Launch external command using subprocess.
-    Unix:    preexec_fn=os.setsid   → new process group (pgid == child pid)
-    Windows: CREATE_NEW_PROCESS_GROUP flag achieves the same isolation
-    FG: wait here; BG: return immediately and add to job table.
+    Runs in a daemon thread.
+    Launches the process with its output going straight to the real console
+    (no PIPE — Windows console apps like ping bypass pipes anyway).
+    The thread just waits for the process to finish or be killed.
     """
-    if not argv:
-        return 0
     try:
-        proc = Popen(argv, **_new_session_kwargs())
-    except FileNotFoundError:
-        print(f"{argv[0]}: command not found", file=sys.stderr)
-        return 127
-    except PermissionError:
-        print(f"{argv[0]}: permission denied", file=sys.stderr)
-        return 126
+        fg_proc = subprocess.Popen(job["args"])   # stdout/stderr → console directly
+        job["process"] = fg_proc
+        job["pid"]     = fg_proc.pid
+        job["status"]  = "Running"
+        fg_proc.wait()
     except Exception as e:
-        print(f"exec error: {e}", file=sys.stderr)
-        return 1
-
-    pgid = _get_pgid(proc.pid)
-    if background:
-        job = Job(proc, raw_cmdline)
-        JOBS.add(job)
-        print(f"[{job.job_id}] {pgid}")
-        return 0
-    else:
-        return wait_foreground(proc, pgid)
-
-def wait_foreground(proc: Popen, pgid: int):
-    global FOREGROUND_PGID
-    FOREGROUND_PGID = pgid
-    rc = None
-    try:
-        while True:
-            rc = proc.poll()
-            if rc is not None:
-                break
-            time.sleep(0.05)
+        print(f"\n[Job {job['job_id']}] error: {e}")
     finally:
-        FOREGROUND_PGID = None
-    return rc if rc is not None else 0
+        if job["status"] != "Terminated":
+            job["status"] = "Finished"
+        print(f"\n[Job {job['job_id']}] '{job['command']}' finished\nmyshell> ", end="", flush=True)
 
-def move_job_foreground(job: Job):
-    try:
-        _send_cont(job.pgid)
-    except ProcessLookupError:
-        job.status = DONE
-        print(f"[{job.job_id}] Done        {job.cmdline}")
-        return 0
 
-    rc = wait_foreground(job.proc, job.pgid)
-    job.refresh_status()
-    if job.status == DONE:
-        JOBS.remove_done()
-    return rc
+# ── main shell loop ───────────────────────────────────────────────────────────
 
-# -------------------------
-# Signal Handling (Shell)
-# -------------------------
-def install_shell_signal_handlers():
-    signal.signal(signal.SIGINT, lambda s, f: None)    # shell ignores Ctrl+C
-    if hasattr(signal, "SIGTSTP"):                      # Unix only (Ctrl+Z)
-        signal.signal(signal.SIGTSTP, lambda s, f: None)
-    if hasattr(signal, "SIGCHLD"):                      # Unix only
-        signal.signal(signal.SIGCHLD, lambda s, f: None)
-
-# -------------------------
-# REPL
-# -------------------------
 def main():
-    install_shell_signal_handlers()
+    global job_counter
 
     while True:
         try:
-            line = input(prompt())
-        except EOFError:
-            print()
-            break
-        except KeyboardInterrupt:
-            print()
-            continue
+            update_jobs()
 
-        argv, background = parse_line(line)
-        if not argv:
-            continue
+            sys.stdout.write("myshell> ")
+            sys.stdout.flush()
+            command = input().strip()
 
-        if is_builtin(argv[0]):
-            try:
-                _ = BUILTINS[argv[0]](argv)
-            except SystemExit:
+            if not command:
+                continue
+
+            background = command.endswith("&")
+            if background:
+                command = command[:-1].strip()
+
+            args = shlex.split(command)
+            if not args:
+                continue
+
+            cmd = args[0]
+
+            # ── exit ──────────────────────────────────────────────────────────
+            if cmd == "exit":
+                print("Exiting shell...")
                 break
-            except Exception as e:
-                print(f"builtin error: {e}", file=sys.stderr)
-            continue
 
-        # External command via PATH
-        launch_external(argv, background, raw_cmdline=line)
+            # ── pwd ───────────────────────────────────────────────────────────
+            elif cmd == "pwd":
+                print(os.getcwd())
+
+            # ── cd ────────────────────────────────────────────────────────────
+            elif cmd == "cd":
+                if len(args) < 2:
+                    print("cd: missing directory")
+                else:
+                    try:
+                        os.chdir(args[1])
+                    except FileNotFoundError:
+                        print("cd: directory not found")
+
+            # ── echo ──────────────────────────────────────────────────────────
+            elif cmd == "echo":
+                print(" ".join(args[1:]))
+
+            # ── clear ─────────────────────────────────────────────────────────
+            elif cmd == "clear":
+                clear_screen()
+
+            # ── ls ────────────────────────────────────────────────────────────
+            elif cmd == "ls":
+                try:
+                    for item in os.listdir():
+                        print(item)
+                except Exception as e:
+                    print(f"ls: error: {e}")
+
+            # ── cat ───────────────────────────────────────────────────────────
+            elif cmd == "cat":
+                if len(args) < 2:
+                    print("cat: missing filename")
+                else:
+                    try:
+                        with open(args[1], "r", encoding="utf-8") as f:
+                            print(f.read(), end="")
+                    except FileNotFoundError:
+                        print("cat: file not found")
+                    except Exception as e:
+                        print(f"cat: error: {e}")
+
+            # ── mkdir ─────────────────────────────────────────────────────────
+            elif cmd == "mkdir":
+                if len(args) < 2:
+                    print("mkdir: missing directory name")
+                else:
+                    try:
+                        os.mkdir(args[1])
+                    except FileExistsError:
+                        print("mkdir: directory already exists")
+                    except Exception as e:
+                        print(f"mkdir: error: {e}")
+
+            # ── rmdir ─────────────────────────────────────────────────────────
+            elif cmd == "rmdir":
+                if len(args) < 2:
+                    print("rmdir: missing directory name")
+                else:
+                    target = args[1]
+                    try:
+                        if not os.path.exists(target):
+                            print("rmdir: directory not found")
+                        elif not os.path.isdir(target):
+                            print("rmdir: not a directory")
+                        else:
+                            visible = [
+                                f for f in os.listdir(target)
+                                if not (IS_WINDOWS and f.lower() in ("desktop.ini", "thumbs.db"))
+                            ]
+                            if visible:
+                                print("rmdir: directory not empty")
+                            else:
+                                shutil.rmtree(target)
+                    except PermissionError:
+                        print("rmdir: permission denied")
+                    except Exception as e:
+                        print(f"rmdir: error: {e}")
+
+            # ── rm ────────────────────────────────────────────────────────────
+            elif cmd == "rm":
+                if len(args) < 2:
+                    print("rm: missing filename")
+                else:
+                    try:
+                        os.remove(args[1])
+                    except FileNotFoundError:
+                        print("rm: file not found")
+                    except Exception as e:
+                        print(f"rm: error: {e}")
+
+            # ── touch ─────────────────────────────────────────────────────────
+            elif cmd == "touch":
+                if len(args) < 2:
+                    print("touch: missing filename")
+                else:
+                    try:
+                        with open(args[1], "a", encoding="utf-8"):
+                            pass
+                    except Exception as e:
+                        print(f"touch: error: {e}")
+
+            # ── jobs ──────────────────────────────────────────────────────────
+            elif cmd == "jobs":
+                update_jobs()
+                if not jobs:
+                    print("No jobs found")
+                else:
+                    for job in jobs:
+                        display_status = job["status"]
+                        if job["job_id"] in fg_threads and fg_threads[job["job_id"]].is_alive():
+                            display_status = "Foregrounded"
+                        print(
+                            f'[{job["job_id"]}] PID={job["pid"]} '
+                            f'{display_status} - {job["command"]}'
+                        )
+
+            # ── fg ────────────────────────────────────────────────────────────
+            elif cmd == "fg":
+                if len(args) < 2:
+                    print("fg: missing job id")
+                else:
+                    try:
+                        job_id = int(args[1])
+                        job = find_job(job_id)
+
+                        if not job:
+                            print("fg: job not found")
+                            continue
+                        if job["status"] == "Finished":
+                            print(f"fg: job [{job_id}] has already finished")
+                            continue
+                        if job_id in fg_threads and fg_threads[job_id].is_alive():
+                            print(f"fg: job [{job_id}] is already foregrounded")
+                            continue
+
+                        # Kill the silent background copy
+                        old_proc = job["process"]
+                        if old_proc.poll() is None:
+                            try:
+                                kill_process(old_proc.pid)
+                            except Exception:
+                                pass
+
+                        print(f"Foregrounding job [{job_id}] {job['command']}")
+                        print(f"  -> type  bg {job_id}  to send back to background\n")
+
+                        t = threading.Thread(target=_run_fg, args=(job,), daemon=True)
+                        fg_threads[job_id] = t
+                        t.start()
+
+                    except ValueError:
+                        print("fg: invalid job id")
+
+            # ── bg ────────────────────────────────────────────────────────────
+            elif cmd == "bg":
+                if len(args) < 2:
+                    print("bg: missing job id")
+                else:
+                    try:
+                        job_id = int(args[1])
+                        job = find_job(job_id)
+
+                        if not job:
+                            print("bg: job not found")
+                            continue
+
+                        is_foregrounded = (
+                            job_id in fg_threads and fg_threads[job_id].is_alive()
+                        )
+
+                        if is_foregrounded:
+                            # Kill the foregrounded process — its thread will notice
+                            # and mark the job Finished.  Then relaunch silently.
+                            old_proc = job["process"]
+                            if old_proc.poll() is None:
+                                try:
+                                    kill_process(old_proc.pid)
+                                except Exception:
+                                    pass
+                            # Wait for the fg thread to finish cleaning up
+                            fg_threads[job_id].join(timeout=2.0)
+
+                            # Relaunch silently
+                            kwargs = {}
+                            if IS_WINDOWS:
+                                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                            bg_proc = subprocess.Popen(
+                                job["args"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                **kwargs
+                            )
+                            job["process"] = bg_proc
+                            job["pid"]     = bg_proc.pid
+                            job["status"]  = "Running"
+                            print(f"Job [{job_id}] sent to background  PID={bg_proc.pid}")
+
+                        elif job["status"] == "Running":
+                            print("bg: job is already running in background")
+                        elif job["status"] == "Finished":
+                            print("bg: job has already finished")
+                        elif job["status"] in ("Stopped", "Terminated"):
+                            resume_process(job["process"])
+                            job["status"] = "Running"
+                            print(f"Job [{job_id}] resumed in background")
+                        else:
+                            print(f"bg: unknown status for job [{job_id}]: {job['status']}")
+
+                    except ValueError:
+                        print("bg: invalid job id")
+
+            # ── kill ──────────────────────────────────────────────────────────
+            elif cmd == "kill":
+                if len(args) < 2:
+                    print("kill: missing pid")
+                else:
+                    try:
+                        pid = int(args[1])
+                        kill_process(pid)
+                        print(f"Process {pid} killed")
+                        for job in jobs:
+                            if job["pid"] == pid:
+                                job["status"] = "Terminated"
+                    except ProcessLookupError:
+                        print("kill: process not found")
+                    except ValueError:
+                        print("kill: invalid pid")
+                    except Exception as e:
+                        print(f"kill error: {e}")
+
+            # ── external commands ─────────────────────────────────────────────
+            else:
+                try:
+                    if background:
+                        kwargs = {}
+                        if IS_WINDOWS:
+                            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                        process = subprocess.Popen(
+                            args,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            **kwargs
+                        )
+                        jobs.append({
+                            "job_id":  job_counter,
+                            "pid":     process.pid,
+                            "command": command,
+                            "args":    args,
+                            "status":  "Running",
+                            "process": process,
+                        })
+                        print(f"[{job_counter}] {process.pid} running in background")
+                        job_counter += 1
+                    else:
+                        process = subprocess.Popen(args)
+                        process.wait()
+
+                except FileNotFoundError:
+                    print("Command not recognized")
+                except Exception as e:
+                    print(f"Command error: {e}")
+
+        except KeyboardInterrupt:
+            print("\nUse 'exit' to quit the shell.")
+        except EOFError:
+            print("\nExiting shell...")
+            break
+
 
 if __name__ == "__main__":
     main()
