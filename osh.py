@@ -44,20 +44,13 @@ class JobTable:
                 return j
         return None
 
-    def find_by_pgid(self, pgid: int):
-        for j in self.jobs:
-            if j.pgid == pgid:
-                return j
-        return None
-
     def list(self):
-        # Refresh statuses before printing
         for j in self.jobs:
             j.refresh_status()
         return self.jobs[:]
 
 JOBS = JobTable()
-FOREGROUND_PGID = None  # Track current foreground job’s pgid (optional)
+FOREGROUND_PGID = None
 
 # -------------------------
 # Built-ins (in-process)
@@ -66,10 +59,10 @@ def builtin_cd(args):
     target = args[1] if len(args) > 1 else os.environ.get("HOME", ".")
     try:
         os.chdir(target)
+        return 0
     except Exception as e:
         print(f"cd: {e}", file=sys.stderr)
         return 1
-    return 0
 
 def builtin_pwd(args):
     print(os.getcwd())
@@ -80,18 +73,93 @@ def builtin_echo(args):
     return 0
 
 def builtin_clear(args):
-    # ANSI clear screen and home cursor
     sys.stdout.write("\033[2J\033[H")
     sys.stdout.flush()
     return 0
 
 def builtin_exit(args):
-    # Optional: terminate background jobs gracefully first
-    # for j in JOBS.list():
-    #     try: os.killpg(j.pgid, signal.SIGTERM)
-    #     except ProcessLookupError: pass
     raise SystemExit(0)
 
+# ----- Filesystem built-ins -----
+def builtin_ls(args):
+    path = args[1] if len(args) > 1 else "."
+    try:
+        for name in sorted(os.listdir(path)):
+            print(name)
+        return 0
+    except Exception as e:
+        print(f"ls: {e}", file=sys.stderr)
+        return 1
+
+def builtin_cat(args):
+    if len(args) < 2:
+        print("cat: missing filename", file=sys.stderr)
+        return 1
+    rc = 0
+    for fname in args[1:]:
+        try:
+            with open(fname, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    print(line, end="")
+        except Exception as e:
+            print(f"cat: {fname}: {e}", file=sys.stderr)
+            rc = 1
+    return rc
+
+def builtin_mkdir(args):
+    if len(args) < 2:
+        print("mkdir: missing operand", file=sys.stderr)
+        return 1
+    rc = 0
+    for d in args[1:]:
+        try:
+            os.mkdir(d)
+        except Exception as e:
+            print(f"mkdir: cannot create directory '{d}': {e}", file=sys.stderr)
+            rc = 1
+    return rc
+
+def builtin_rmdir(args):
+    if len(args) < 2:
+        print("rmdir: missing operand", file=sys.stderr)
+        return 1
+    rc = 0
+    for d in args[1:]:
+        try:
+            os.rmdir(d)
+        except Exception as e:
+            print(f"rmdir: failed to remove '{d}': {e}", file=sys.stderr)
+            rc = 1
+    return rc
+
+def builtin_rm(args):
+    if len(args) < 2:
+        print("rm: missing operand", file=sys.stderr)
+        return 1
+    rc = 0
+    for f in args[1:]:
+        try:
+            os.remove(f)
+        except Exception as e:
+            print(f"rm: cannot remove '{f}': {e}", file=sys.stderr)
+            rc = 1
+    return rc
+
+def builtin_touch(args):
+    if len(args) < 2:
+        print("touch: missing file operand", file=sys.stderr)
+        return 1
+    rc = 0
+    for f in args[1:]:
+        try:
+            with open(f, "a"):
+                os.utime(f, None)
+        except Exception as e:
+            print(f"touch: cannot touch '{f}': {e}", file=sys.stderr)
+            rc = 1
+    return rc
+
+# ----- Job control built-ins -----
 def builtin_jobs(args):
     for j in JOBS.list():
         print(f"[{j.job_id}] {j.status:7} {j.pgid}   {j.cmdline}")
@@ -133,7 +201,6 @@ def builtin_kill(args):
         return 1
     pid_or_pgid = int(args[1])
     try:
-        # Prefer killing a process group if possible
         try:
             os.killpg(pid_or_pgid, signal.SIGTERM)
         except Exception:
@@ -145,20 +212,26 @@ def builtin_kill(args):
 
 def builtin_help(args):
     print("""Built-ins:
-  cd [dir]        change directory
-  pwd             print working directory
-  echo [text]     print text
-  clear           clear screen
-  exit            exit shell
+  cd [dir]           change directory
+  pwd                print working directory
+  echo [text]        print text
+  clear              clear screen
+  exit               exit shell
+
+  ls [dir]           list directory entries
+  cat <file> [...]   print file contents
+  mkdir <dir> [...]  create directories
+  rmdir <dir> [...]  remove empty directories
+  rm <file> [...]    remove files
+  touch <file> [...] create/update files
 
 Process & job control:
-  jobs            list background jobs
-  fg %<id>        bring job to foreground
-  bg %<id>        resume job in background
-  kill <pid|pgid> terminate process or process group
+  jobs               list background jobs
+  fg %<id>           bring job to foreground
+  bg %<id>           resume job in background
+  kill <pid|pgid>    terminate process or process group
 
-External commands run via PATH (e.g., ls, cat, sleep, etc.).
-Use '&' for background:  sleep 5 &""")
+External commands run from PATH (e.g., /bin/ls). Use '&' to run in background.""")
     return 0
 
 BUILTINS = {
@@ -168,7 +241,12 @@ BUILTINS = {
     "clear": builtin_clear,
     "exit": builtin_exit,
     "help": builtin_help,
-    # Job control / process mgmt
+    "ls": builtin_ls,
+    "cat": builtin_cat,
+    "mkdir": builtin_mkdir,
+    "rmdir": builtin_rmdir,
+    "rm": builtin_rm,
+    "touch": builtin_touch,
     "jobs": builtin_jobs,
     "fg": builtin_fg,
     "bg": builtin_bg,
@@ -184,23 +262,28 @@ def is_builtin(cmd):
 def parse_line(line: str):
     """
     Returns (argv:list[str], background:bool)
-    - Uses shlex for shell-like parsing (quotes, escaped spaces).
-    - Detects trailing '&' for background (works with or without space).
+    Uses shlex for shell-like parsing (quotes, escaped spaces).
+    Detects trailing '&' for background (with or without space).
     """
     line = line.strip()
     if not line:
         return [], False
 
-    # Background detection that works for 'cmd &' and also 'cmd&'
     bg = False
     if line.endswith("&"):
-        # Important: ensure '&' is not within quotes. shlex can help parse.
-        tokens = shlex.split(line[:-1].rstrip(), posix=True)
-        bg = True
+        try:
+            tokens = shlex.split(line[:-1].rstrip(), posix=True)
+            bg = True
+        except ValueError as e:
+            print(f"parse error: {e}", file=sys.stderr)
+            return [], False
     else:
-        tokens = shlex.split(line, posix=True)
+        try:
+            tokens = shlex.split(line, posix=True)
+        except ValueError as e:
+            print(f"parse error: {e}", file=sys.stderr)
+            return [], False
 
-    # Also handle the case where user typed a separated '&' token
     if tokens and tokens[-1] == "&":
         tokens = tokens[:-1]
         bg = True
@@ -209,11 +292,10 @@ def parse_line(line: str):
 
 def prompt():
     try:
-        cwd = os.getcwd()
+        base = os.path.basename(os.getcwd()) or "/"
     except Exception:
-        cwd = "?"
-    # Show only basename of cwd for a compact prompt
-    return f"osh:{os.path.basename(cwd) or '/'}$ "
+        base = "?"
+    return f"osh:{base}$ "
 
 # -------------------------
 # Execution
@@ -222,12 +304,12 @@ def launch_external(argv, background: bool, raw_cmdline: str):
     """
     Launch external command using subprocess.
     - preexec_fn=os.setsid starts a new process group (pgid == child pid).
-    - For FG: wait() here; for BG: return immediately and add to job table.
+    - FG: wait here; BG: return immediately and add to job table.
     """
     if not argv:
         return 0
     try:
-        proc = Popen(argv, preexec_fn=os.setsid)  # new process group
+        proc = Popen(argv, preexec_fn=os.setsid)
     except FileNotFoundError:
         print(f"{argv[0]}: command not found", file=sys.stderr)
         return 127
@@ -248,14 +330,8 @@ def launch_external(argv, background: bool, raw_cmdline: str):
         return wait_foreground(proc, pgid)
 
 def wait_foreground(proc: Popen, pgid: int):
-    """
-    Wait for foreground job to complete. We keep it simple for D1:
-    - Block until child finishes.
-    - Let Ctrl+C interrupt the child (shell ignores SIGINT).
-    """
     global FOREGROUND_PGID
     FOREGROUND_PGID = pgid
-
     rc = None
     try:
         while True:
@@ -265,15 +341,9 @@ def wait_foreground(proc: Popen, pgid: int):
             time.sleep(0.05)
     finally:
         FOREGROUND_PGID = None
-
     return rc if rc is not None else 0
 
 def move_job_foreground(job: Job):
-    """
-    Bring a background job to the foreground:
-    - Send SIGCONT in case it was stopped
-    - Wait until it finishes
-    """
     try:
         os.killpg(job.pgid, signal.SIGCONT)
     except ProcessLookupError:
@@ -291,10 +361,8 @@ def move_job_foreground(job: Job):
 # Signal Handling (Shell)
 # -------------------------
 def install_shell_signal_handlers():
-    # Shell ignores SIGINT and SIGTSTP so it isn't killed/stopped by Ctrl+C/Z
-    signal.signal(signal.SIGINT, lambda s, f: None)
-    signal.signal(signal.SIGTSTP, lambda s, f: None)
-    # Optional: handle SIGCHLD; here we just lazily poll in jobs()
+    signal.signal(signal.SIGINT, lambda s, f: None)   # shell ignores Ctrl+C
+    signal.signal(signal.SIGTSTP, lambda s, f: None)  # shell ignores Ctrl+Z
     try:
         signal.signal(signal.SIGCHLD, lambda s, f: None)
     except AttributeError:
@@ -310,10 +378,9 @@ def main():
         try:
             line = input(prompt())
         except EOFError:
-            print()  # newline on Ctrl+D
+            print()
             break
         except KeyboardInterrupt:
-            # User pressed Ctrl+C at the prompt; just go to next line
             print()
             continue
 
@@ -323,14 +390,14 @@ def main():
 
         if is_builtin(argv[0]):
             try:
-                _ = BUILTINS[argv[0]](argv)   # call the builtin
+                _ = BUILTINS[argv[0]](argv)  # <-- CORRECT CALL
             except SystemExit:
-                break                          # exit builtin
+                break                         # exit builtin
             except Exception as e:
                 print(f"builtin error: {e}", file=sys.stderr)
             continue
 
-        # External command
+        # External command via PATH
         launch_external(argv, background, raw_cmdline=line)
 
 if __name__ == "__main__":
