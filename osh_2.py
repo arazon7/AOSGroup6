@@ -45,10 +45,47 @@ def kill_process(pid):
             ["taskkill", "/F", "/T", "/PID", str(pid)],
             capture_output=True, text=True
         )
-        if result.returncode != 0:
+        # /T kills child-tree; return code 0 = success, 128 = already gone — both are fine
+        if result.returncode not in (0, 128):
             raise ProcessLookupError(f"Process {pid} not found or could not be killed")
     else:
         os.kill(pid, signal.SIGKILL)
+
+
+def kill_job_fully(job):
+    """
+    Kill a job's tracked PID AND any surviving re-spawned windows.
+    Windows GUI apps (notepad, calc, etc.) often re-host themselves under a
+    new PID immediately after launch, so the original PID disappears but the
+    window stays open.  We handle this by:
+      1. taskkill /F /T /PID  — kill the tracked PID + its children
+      2. taskkill /F /IM <exe>.exe — kill any process still running with that
+         image name (catches the re-spawned window)
+    On Mac/Linux a simple SIGKILL on the PID is sufficient.
+    """
+    if not IS_WINDOWS:
+        try:
+            os.kill(job["pid"], signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        return
+
+    # Step 1: kill by PID (may already be gone for re-spawning apps)
+    subprocess.run(
+        ["taskkill", "/F", "/T", "/PID", str(job["pid"])],
+        capture_output=True, text=True
+    )
+
+    # Step 2: derive the exe name from the command and kill any survivor
+    exe = job["args"][0]                        # e.g. "notepad" or "notepad.exe"
+    if not exe.lower().endswith(".exe"):
+        exe = exe + ".exe"
+    exe_name = os.path.basename(exe)            # strip any path prefix
+
+    subprocess.run(
+        ["taskkill", "/F", "/IM", exe_name],
+        capture_output=True, text=True
+    )   # ignore return code — if nothing matched that's fine
 
 
 def resume_process(process):
@@ -296,7 +333,7 @@ def main():
                             old_proc = job["process"]
                             if old_proc.poll() is None:
                                 try:
-                                    kill_process(old_proc.pid)
+                                    kill_job_fully(job)
                                 except Exception:
                                     pass
                             # Wait for the fg thread to finish cleaning up
@@ -338,11 +375,19 @@ def main():
                 else:
                     try:
                         pid = int(args[1])
-                        kill_process(pid)
-                        print(f"Process {pid} killed")
-                        for job in jobs:
-                            if job["pid"] == pid:
-                                job["status"] = "Terminated"
+
+                        # Find the matching job (if any) so we can kill by exe name too
+                        matched_job = next((j for j in jobs if j["pid"] == pid), None)
+
+                        if matched_job:
+                            kill_job_fully(matched_job)
+                            matched_job["status"] = "Terminated"
+                            print(f"Process {pid} killed")
+                        else:
+                            # PID not in our job list — plain kill
+                            kill_process(pid)
+                            print(f"Process {pid} killed")
+
                     except ProcessLookupError:
                         print("kill: process not found")
                     except ValueError:
