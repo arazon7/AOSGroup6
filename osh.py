@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import os
+import platform
 import shlex
 import signal
 import sys
 import time
 from subprocess import Popen
+
+IS_WINDOWS = platform.system() == "Windows"
 
 # -------------------------
 # Job Table (basic)
@@ -17,7 +20,7 @@ class Job:
         self.job_id = Job._next_id
         Job._next_id += 1
         self.proc = proc                          # subprocess.Popen handle
-        self.pgid = os.getpgid(proc.pid)          # process group id
+        self.pgid = _get_pgid(proc.pid)           # process group id
         self.cmdline = cmdline
         self.status = RUNNING
 
@@ -51,6 +54,34 @@ class JobTable:
 
 JOBS = JobTable()
 FOREGROUND_PGID = None
+
+# -------------------------
+# Cross-platform helpers
+# -------------------------
+def _get_pgid(pid):
+    """Return process group id; falls back to pid on Windows."""
+    if IS_WINDOWS:
+        return pid
+    return os.getpgid(pid)
+
+def _new_session_kwargs():
+    """Subprocess kwargs to isolate the child into its own process group."""
+    if IS_WINDOWS:
+        import subprocess
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"preexec_fn": os.setsid}
+
+def _killpg(pgid, sig):
+    """Send signal to a process group; single-process fallback on Windows."""
+    if IS_WINDOWS:
+        os.kill(pgid, signal.SIGTERM)
+    else:
+        os.killpg(pgid, sig)
+
+def _send_cont(pgid):
+    """Resume a stopped process group (no-op on Windows — no SIGCONT)."""
+    if not IS_WINDOWS and hasattr(signal, "SIGCONT"):
+        os.killpg(pgid, signal.SIGCONT)
 
 # -------------------------
 # Built-ins (in-process)
@@ -186,7 +217,7 @@ def builtin_bg(args):
         print(f"bg: no such job {jid}", file=sys.stderr)
         return 1
     try:
-        os.killpg(job.pgid, signal.SIGCONT)
+        _send_cont(job.pgid)
         job.status = RUNNING
         print(f"[{job.job_id}] Continued   {job.cmdline}")
         return 0
@@ -202,7 +233,7 @@ def builtin_kill(args):
     pid_or_pgid = int(args[1])
     try:
         try:
-            os.killpg(pid_or_pgid, signal.SIGTERM)
+            _killpg(pid_or_pgid, signal.SIGTERM)
         except Exception:
             os.kill(pid_or_pgid, signal.SIGTERM)
         return 0
@@ -211,7 +242,8 @@ def builtin_kill(args):
         return 1
 
 def builtin_help(args):
-    print("""Built-ins:
+    bg_example = "ping -n 5 127.0.0.1 &" if IS_WINDOWS else "sleep 5 &"
+    print(f"""Built-ins:
   cd [dir]           change directory
   pwd                print working directory
   echo [text]        print text
@@ -228,10 +260,11 @@ def builtin_help(args):
 Process & job control:
   jobs               list background jobs
   fg %<id>           bring job to foreground
-  bg %<id>           resume job in background
+  bg %<id>           resume job in background (Unix only)
   kill <pid|pgid>    terminate process or process group
 
-External commands run from PATH (e.g., /bin/ls). Use '&' to run in background.""")
+External commands run from PATH. Use '&' to run in background.
+  Example: {bg_example}""")
     return 0
 
 BUILTINS = {
@@ -264,22 +297,24 @@ def parse_line(line: str):
     Returns (argv:list[str], background:bool)
     Uses shlex for shell-like parsing (quotes, escaped spaces).
     Detects trailing '&' for background (with or without space).
+    posix=False on Windows to avoid mishandling backslash paths.
     """
     line = line.strip()
     if not line:
         return [], False
 
+    posix_mode = not IS_WINDOWS
     bg = False
     if line.endswith("&"):
         try:
-            tokens = shlex.split(line[:-1].rstrip(), posix=True)
+            tokens = shlex.split(line[:-1].rstrip(), posix=posix_mode)
             bg = True
         except ValueError as e:
             print(f"parse error: {e}", file=sys.stderr)
             return [], False
     else:
         try:
-            tokens = shlex.split(line, posix=True)
+            tokens = shlex.split(line, posix=posix_mode)
         except ValueError as e:
             print(f"parse error: {e}", file=sys.stderr)
             return [], False
@@ -303,13 +338,14 @@ def prompt():
 def launch_external(argv, background: bool, raw_cmdline: str):
     """
     Launch external command using subprocess.
-    - preexec_fn=os.setsid starts a new process group (pgid == child pid).
-    - FG: wait here; BG: return immediately and add to job table.
+    Unix:    preexec_fn=os.setsid   → new process group (pgid == child pid)
+    Windows: CREATE_NEW_PROCESS_GROUP flag achieves the same isolation
+    FG: wait here; BG: return immediately and add to job table.
     """
     if not argv:
         return 0
     try:
-        proc = Popen(argv, preexec_fn=os.setsid)
+        proc = Popen(argv, **_new_session_kwargs())
     except FileNotFoundError:
         print(f"{argv[0]}: command not found", file=sys.stderr)
         return 127
@@ -320,7 +356,7 @@ def launch_external(argv, background: bool, raw_cmdline: str):
         print(f"exec error: {e}", file=sys.stderr)
         return 1
 
-    pgid = os.getpgid(proc.pid)
+    pgid = _get_pgid(proc.pid)
     if background:
         job = Job(proc, raw_cmdline)
         JOBS.add(job)
@@ -345,7 +381,7 @@ def wait_foreground(proc: Popen, pgid: int):
 
 def move_job_foreground(job: Job):
     try:
-        os.killpg(job.pgid, signal.SIGCONT)
+        _send_cont(job.pgid)
     except ProcessLookupError:
         job.status = DONE
         print(f"[{job.job_id}] Done        {job.cmdline}")
@@ -361,12 +397,11 @@ def move_job_foreground(job: Job):
 # Signal Handling (Shell)
 # -------------------------
 def install_shell_signal_handlers():
-    signal.signal(signal.SIGINT, lambda s, f: None)   # shell ignores Ctrl+C
-    signal.signal(signal.SIGTSTP, lambda s, f: None)  # shell ignores Ctrl+Z
-    try:
+    signal.signal(signal.SIGINT, lambda s, f: None)    # shell ignores Ctrl+C
+    if hasattr(signal, "SIGTSTP"):                      # Unix only (Ctrl+Z)
+        signal.signal(signal.SIGTSTP, lambda s, f: None)
+    if hasattr(signal, "SIGCHLD"):                      # Unix only
         signal.signal(signal.SIGCHLD, lambda s, f: None)
-    except AttributeError:
-        pass
 
 # -------------------------
 # REPL
@@ -390,9 +425,9 @@ def main():
 
         if is_builtin(argv[0]):
             try:
-                _ = BUILTINS[argv[0]](argv)  # <-- CORRECT CALL
+                _ = BUILTINS[argv[0]](argv)
             except SystemExit:
-                break                         # exit builtin
+                break
             except Exception as e:
                 print(f"builtin error: {e}", file=sys.stderr)
             continue
