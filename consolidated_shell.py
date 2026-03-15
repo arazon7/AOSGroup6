@@ -15,6 +15,12 @@ New shell commands
   scheduler priority         Run Priority scheduling demo
   scheduler all              Run both scheduling demos
 
+--
+mem --frames 3 --algo LRU --free-after 1
+mem --frames 3 --algo FIFO
+mem --frames 3 --algo LRU
+pc --producers 2 --consumers 2 --bufsize 3 --items 4
+--
   mem [--frames N] [--algo FIFO|LRU] [--quiet] [--free-after PID]
                              Run paging/memory management simulation
 
